@@ -169,13 +169,26 @@ jobs:
           # REJEITAR o update — e falharia DEPOIS da troca de imagem. Só entram valores presentes.
           SECRET_ARGS=()
           ENV_ARGS=()
-          # SqlConnectionString é OBRIGATÓRIO — as 7 tools consultam o SQL.
-          if [ -z "${SQL_CONNECTION_STRING:-}" ]; then
-            echo "::error::PHASE05_SQL_CONNECTION_STRING ausente — o McpServer não consegue consultar o SQL."
-            exit 1
+          # SqlConnectionString — as 7 tools consultam o SQL. Três vias:
+          #  1) fork secret PREENCHIDO → aplica inline (protege quem NÃO fez o caminho cofre);
+          #  2) fork secret VAZIO + secret 'sql-conn' JÁ existe no Container App (caminho COFRE,
+          #     Key Vault reference criada no Portal) → NÃO sobrescreve a blindagem; só garante o env var;
+          #  3) fork secret VAZIO + secret ausente → erro claro (nenhuma das duas vias configurada).
+          if [ -n "${SQL_CONNECTION_STRING:-}" ]; then
+            SECRET_ARGS+=( "sql-conn=${SQL_CONNECTION_STRING}" )
+            ENV_ARGS+=( "SqlConnectionString=secretref:sql-conn" )
+          else
+            SQL_SECRET_EXISTS=$(az containerapp secret list \
+              --name "$MCP_APP_NAME" --resource-group "$RG" \
+              --query "[?name=='sql-conn'] | length(@)" -o tsv)
+            if [ "${SQL_SECRET_EXISTS:-0}" -ge 1 ]; then
+              echo "::notice::Caminho COFRE detectado — secret 'sql-conn' já existe no Container App (Key Vault reference). A blindagem NÃO será sobrescrita; apenas o env var será garantido (secretref:sql-conn)."
+              ENV_ARGS+=( "SqlConnectionString=secretref:sql-conn" )
+            else
+              echo "::error::PHASE05_SQL_CONNECTION_STRING vazio E o secret 'sql-conn' não existe no Container App — configure um dos dois (fork secret INLINE ou Key Vault reference no Portal)."
+              exit 1
+            fi
           fi
-          SECRET_ARGS+=( "sql-conn=${SQL_CONNECTION_STRING}" )
-          ENV_ARGS+=( "SqlConnectionString=secretref:sql-conn" )
           # GEMINI — necessário p/ o chatbot; ausente = proxy sem chave (aviso, não erro).
           if [ -n "${GEMINI_API_KEY:-}" ]; then
             SECRET_ARGS+=( "gemini-key=${GEMINI_API_KEY}" ); ENV_ARGS+=( "GEMINI_API_KEY=secretref:gemini-key" )
@@ -197,13 +210,19 @@ jobs:
           else
             echo "::warning::GATEWAY_SHARED_SECRET não definido como secret do fork — assumindo o caminho MANUAL (App Setting no Portal, guia Fase 3.3 / 4.2). Se você NÃO o configurou manualmente, o X-Gateway-Key ficará desarmado."
           fi
-          # Aplica só os secrets/env-vars presentes.
-          az containerapp secret set \
-            --name "$MCP_APP_NAME" --resource-group "$RG" \
-            --secrets "${SECRET_ARGS[@]}"
-          az containerapp update \
-            --name "$MCP_APP_NAME" --resource-group "$RG" \
-            --set-env-vars "${ENV_ARGS[@]}"
+          # Aplica só os secrets/env-vars presentes. No caminho COFRE puro o SECRET_ARGS pode
+          # ficar VAZIO — expandir "${SECRET_ARGS[@]}" com `set -u` estouraria e o az falharia
+          # sem --secrets; por isso guardamos ambos os blocos com a contagem do array.
+          if [ ${#SECRET_ARGS[@]} -gt 0 ]; then
+            az containerapp secret set \
+              --name "$MCP_APP_NAME" --resource-group "$RG" \
+              --secrets "${SECRET_ARGS[@]}"
+          fi
+          if [ ${#ENV_ARGS[@]} -gt 0 ]; then
+            az containerapp update \
+              --name "$MCP_APP_NAME" --resource-group "$RG" \
+              --set-env-vars "${ENV_ARGS[@]}"
+          fi
 
       - name: '[mcp-server] Smoke — revisão provisionada (ingress interno; sem curl público)'
         # O McpServer tem ingress INTERNO (só o gateway no mesmo CAE o alcança) — não há
@@ -380,17 +399,30 @@ jobs:
             --name "$FLOW_APP_NAME" \
             --resource-group "$RG" \
             --image "$FLOW_IMAGE_TAG"
-          # Secret sensível (connection string do SignalR) — OBRIGATÓRIO: o FlowHub é hospedado
-          # pelo próprio FlowEvents (AddAzureSignalR). Vazio faria o ARM rejeitar o secret set
-          # DEPOIS da troca de imagem — falha cedo com mensagem clara.
-          if [ -z "${SIGNALR_CONNECTION_STRING:-}" ]; then
-            echo "::error::PHASE06_SIGNALR_CONNECTION_STRING ausente — o FlowEvents não consegue hospedar o FlowHub."
-            exit 1
+          # Secret sensível (connection string do SignalR): o FlowHub é hospedado pelo próprio
+          # FlowEvents (AddAzureSignalR). Três vias:
+          #  1) fork secret PREENCHIDO → aplica inline (protege quem NÃO fez o caminho cofre);
+          #  2) fork secret VAZIO + 'azure-signalr-conn' JÁ existe (caminho COFRE, Key Vault
+          #     reference no Portal) → NÃO sobrescreve a blindagem;
+          #  3) fork secret VAZIO + secret ausente → erro claro (nenhuma das duas vias configurada).
+          if [ -n "${SIGNALR_CONNECTION_STRING:-}" ]; then
+            az containerapp secret set \
+              --name "$FLOW_APP_NAME" --resource-group "$RG" \
+              --secrets "azure-signalr-conn=${SIGNALR_CONNECTION_STRING}"
+          else
+            SIGNALR_SECRET_EXISTS=$(az containerapp secret list \
+              --name "$FLOW_APP_NAME" --resource-group "$RG" \
+              --query "[?name=='azure-signalr-conn'] | length(@)" -o tsv)
+            if [ "${SIGNALR_SECRET_EXISTS:-0}" -ge 1 ]; then
+              echo "::notice::Caminho COFRE detectado — secret 'azure-signalr-conn' já existe no Container App (Key Vault reference). A blindagem NÃO será sobrescrita; o env var AzureSignalRConnectionString continua apontando pra ele."
+            else
+              echo "::error::PHASE06_SIGNALR_CONNECTION_STRING vazio E o secret 'azure-signalr-conn' não existe no Container App — configure um dos dois (fork secret INLINE ou Key Vault reference no Portal)."
+              exit 1
+            fi
           fi
-          az containerapp secret set \
-            --name "$FLOW_APP_NAME" --resource-group "$RG" \
-            --secrets "azure-signalr-conn=${SIGNALR_CONNECTION_STRING}"
           # Env vars (secretref p/ a connection string; valores não sensíveis diretos).
+          # O AzureSignalRConnectionString aponta pro secret 'azure-signalr-conn' independentemente
+          # da via (inline ou cofre) — idempotente, sempre reaplicado.
           az containerapp update \
             --name "$FLOW_APP_NAME" --resource-group "$RG" \
             --set-env-vars \
